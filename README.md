@@ -90,10 +90,11 @@ A background process that:
 - **Resume Strategy**: Resumes via PTY input (`continue\n`) if running, or executes `claude --continue`.
 - **Transcript Watcher**: Watches `~/.claude/projects` for session events.
 
-### Codex CLI (`codex`)
-- **Detection**: Matches patterns like `try again at HH:MM` or `resets_at: YYYY-MM-DD...`
-- **Resume Strategy**: Resumes by executing `codex exec resume --last "<CODEX_SAFE_RESUME_PROMPT>"`.
-- **Transcript Watcher**: Watches `~/.codex/sessions`.
+### Codex CLI and Codex Desktop (`codex`)
+- **Detection**: Uses Codex error events from the session transcript and extracts a reset time when present.
+- **Resume Strategy**: Resumes a transcript-observed session by its exact Codex thread ID using `codex exec resume <SESSION_ID> "<CODEX_SAFE_RESUME_PROMPT>"`; it never selects a GUI session with `--last`.
+- **Transcript Watcher**: Watches `~/.codex/sessions` and reads the thread ID and working directory from `session_meta`.
+- **Codex Desktop**: AAR observes local Codex Desktop transcripts and runs continuation through the Codex CLI in the background. It does not modify `ChatGPT.app`, and the GUI may not reflect background progress while open.
 
 ### Google Antigravity CLI (`agy`)
 - **Detection**: Matches common Antigravity quota messages.
@@ -149,8 +150,11 @@ Prints the daemon status and a list of currently waiting sessions, including tim
 ```bash
 aar sessions
 aar sessions --json
+aar gui-sessions
+aar codex-check
+aar cancel-session <session-id>
 ```
-Lists all saved session logs and statuses.
+`aar gui-sessions` lists Codex Desktop sessions where AAR detected a limit. `aar codex-check` checks local monitoring configuration and Codex CLI resume help without making an API request. `aar cancel-session` disables automatic continuation for a waiting or failed session.
 
 ### recover
 ```bash
@@ -159,6 +163,7 @@ aar recover --last
 aar recover --id <session-id>
 ```
 Manually triggers recovery for a failed or waiting session in the background.
+For a Codex transcript session, use the ID printed by `aar gui-sessions`; AAR passes that exact thread ID to Codex CLI.
 
 ### retry-now
 ```bash
@@ -172,8 +177,7 @@ Immediately resumes a session, bypassing the waiting time. If the reset time has
 ```bash
 aar integrate <codex|antigravity|all>
 ```
-Wraps the internal binary of Mac desktop applications (Codex App / Antigravity App) with `aar`.
-This allows the background daemon to automatically monitor and auto-resume API limits encountered within these desktop GUI environments.
+Integrates supported application binaries. Codex Desktop is observed through its transcript files instead; `aar integrate codex` intentionally does not modify any installed Codex or ChatGPT application files.
 
 ### unintegrate
 ```bash

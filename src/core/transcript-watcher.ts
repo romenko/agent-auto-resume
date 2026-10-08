@@ -1,6 +1,7 @@
 import chokidar from "chokidar";
 import path from "path";
 import fs from "fs-extra";
+import readline from "readline";
 import { loadConfig, resolveHome, createSession, listSessions, updateSession } from "./session-store.js";
 import { logger } from "./logger.js";
 import { getProvider } from "../providers/index.js";
@@ -8,8 +9,10 @@ import { detectLimit } from "./detector.js";
 import { ProviderName } from "./types.js";
 
 const fileCursors = new Map<string, number>();
+const filePartialLines = new Map<string, string>();
+const fileMetadata = new Map<string, { sessionId?: string; cwd?: string; desktopSession: boolean }>();
 
-// 最近処理したリミット検知のデバウンス用 (同一プロバイダーで30秒以内の重複を防止)
+// A single Codex session can emit duplicate errors, but unrelated sessions must not suppress each other.
 const lastLimitDetectedAt = new Map<string, number>();
 const LIMIT_DETECT_DEBOUNCE_MS = 30_000;
 
@@ -63,13 +66,37 @@ export async function startTranscriptWatcher(abortSignal?: AbortSignal) {
       });
 
       watcher.on("add", async (filePath) => {
-        // 新しいファイル発見時: 既存内容はスキップし、カーソルを末尾にセット
-        // これにより、過去のリミットメッセージを再検知しない
-        try {
-          const stat = await fs.stat(filePath);
-          fileCursors.set(filePath, stat.size);
-        } catch {
-          fileCursors.set(filePath, 0);
+        fileCursors.set(filePath, 0);
+        await handleFileChange(filePath, providerName);
+      });
+      watcher.on("ready", async () => {
+        const watched = watcher.getWatched();
+        const provider = getProvider(providerName);
+        for (const [directory, names] of Object.entries(watched)) {
+          for (const name of names) {
+            const filePath = path.join(directory, name);
+            if (path.extname(filePath).toLowerCase() !== ".jsonl") continue;
+            try {
+              if (providerName === "codex" && provider.parseTranscriptEvent) {
+                const stream = fs.createReadStream(filePath, { encoding: "utf-8" });
+                const reader = readline.createInterface({ input: stream, crlfDelay: Infinity });
+                const firstLine = await reader[Symbol.asyncIterator]().next();
+                const event = firstLine.done ? undefined : provider.parseTranscriptEvent(firstLine.value);
+                if (event) {
+                  fileMetadata.set(filePath, {
+                    sessionId: event.sessionId,
+                    cwd: event.cwd,
+                    desktopSession: event.desktopSession || false,
+                  });
+                }
+                reader.close();
+                stream.destroy();
+              }
+              fileCursors.set(filePath, (await fs.stat(filePath)).size);
+            } catch {
+              // A file may disappear while the initial directory scan is completing.
+            }
+          }
         }
       });
       watcher.on("change", (filePath) => handleFileChange(filePath, providerName));
@@ -220,7 +247,9 @@ async function handleFileChange(filePath: string, providerName: ProviderName) {
     fileCursors.set(filePath, stat.size);
 
     const content = buffer.toString("utf-8");
-    const lines = content.split(/\r?\n/);
+    const combined = `${filePartialLines.get(filePath) || ""}${content}`;
+    const lines = combined.split(/\r?\n/);
+    filePartialLines.set(filePath, lines.pop() || "");
     const provider = getProvider(providerName);
 
     const fileSessionId = getSessionIdFromPath(filePath, providerName);
@@ -236,28 +265,47 @@ async function handleFileChange(filePath: string, providerName: ProviderName) {
       derivedCwd = await inferCwdFromTranscript(filePath);
     }
 
+    const metadata = fileMetadata.get(filePath) || { desktopSession: false };
+    let providerSessionId = metadata.sessionId || fileSessionId;
+    let providerCwd = metadata.cwd || derivedCwd;
+    let codexDesktop = metadata.desktopSession;
     for (const line of lines) {
       if (!line.trim()) continue;
 
       const event = provider.parseTranscriptEvent!(line);
-      if (event && event.text) {
+      if (event?.sessionId && providerName === "codex") {
+        providerSessionId = event.sessionId;
+      }
+      if (event?.cwd) {
+        providerCwd = event.cwd;
+      }
+      if (event?.desktopSession) {
+        codexDesktop = true;
+      }
+      fileMetadata.set(filePath, {
+        sessionId: providerSessionId,
+        cwd: providerCwd,
+        desktopSession: codexDesktop,
+      });
+      if (event && event.text && (providerName !== "codex" || event.limitEvent)) {
         const refDate = event.timestamp ? new Date(event.timestamp) : undefined;
         const detection = detectLimit(event.text, providerName, refDate);
         if (detection.matched) {
           // デバウンス: 同じプロバイダーで短期間に連続検知を防止
           const now = Date.now();
-          const lastDetect = lastLimitDetectedAt.get(providerName) || 0;
+          const debounceKey = `${providerName}:${providerSessionId}`;
+          const lastDetect = lastLimitDetectedAt.get(debounceKey) || 0;
           if (now - lastDetect < LIMIT_DETECT_DEBOUNCE_MS) {
             logger.debug(`Skipping duplicate limit detection for ${providerName} (debounce)`, "aar");
             continue;
           }
-          lastLimitDetectedAt.set(providerName, now);
+          lastLimitDetectedAt.set(debounceKey, now);
 
           logger.warn(`Limit detected via transcript watcher in file ${filePath}: ${detection.reason}`, "aar");
 
           const sessions = await listSessions();
 
-          const targetSessionId = (event as any).sessionId || fileSessionId;
+          const targetSessionId = providerSessionId;
 
           // 既に waiting_limit_reset のセッションがある場合は重複作成しない
           const existingWaiting = sessions.find(
@@ -275,6 +323,8 @@ async function handleFileChange(filePath: string, providerName: ProviderName) {
                 resetAt: resetAtStr,
                 lastOutputSnippet: event.text.slice(-1000),
                 transcriptPath: filePath,
+                providerSessionId,
+                codexDesktop: codexDesktop || undefined,
               });
               logger.info(`Updated reset time for existing session ${existingWaiting.id}`, "aar");
             }
@@ -297,7 +347,9 @@ async function handleFileChange(filePath: string, providerName: ProviderName) {
                 resetAt: resetAtStr,
                 lastOutputSnippet: event.text.slice(-1000),
                 transcriptPath: filePath,
-                cwd: event.cwd || derivedCwd || matchedSession.cwd,
+                cwd: providerCwd || matchedSession.cwd,
+                providerSessionId,
+                codexDesktop: codexDesktop || undefined,
               });
               logger.info(`Updated existing session ${matchedSession.id} to waiting_limit_reset`, "aar");
             }
@@ -306,7 +358,7 @@ async function handleFileChange(filePath: string, providerName: ProviderName) {
             const newSession = await createSession({
               id: targetSessionId,
               provider: providerName,
-              cwd: event.cwd || derivedCwd || process.cwd(),
+              cwd: providerCwd || process.cwd(),
               originalCommand: provider.defaultCommand,
               resumeStrategy: providerName === "claude" ? "pty-input" : "command",
               status: "waiting_limit_reset",
@@ -319,6 +371,8 @@ async function handleFileChange(filePath: string, providerName: ProviderName) {
               managedByAar: false,
               source: "transcript-watcher",
               transcriptPath: filePath,
+              providerSessionId: providerName === "codex" ? providerSessionId : undefined,
+              codexDesktop: codexDesktop || undefined,
             });
             logger.info(`Created new session ${newSession.id} via transcript-watcher`, "aar");
           }

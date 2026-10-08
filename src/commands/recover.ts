@@ -45,6 +45,7 @@ export async function runRecover(options: { last?: boolean; id?: string }) {
   if (success) {
     console.log(chalk.green(`✓ Session ${session.id} recovered and completed successfully.`));
   } else {
-    console.log(chalk.red(`✗ Recovery failed or session hit limit again. Status is currently saved.`));
+    const updated = await getSession(session.id);
+    console.log(chalk.red(`✗ Recovery failed or session hit limit again. ${updated?.resumeError || "Status is currently saved."}`));
   }
 }

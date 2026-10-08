@@ -49,8 +49,12 @@ export type SessionState = {
     | "tmux-watcher"
     | "manual-recover";
   pid?: number;
+  resumePid?: number;
   tmuxPaneId?: string;
   transcriptPath?: string;
+  providerSessionId?: string;
+  codexDesktop?: boolean;
+  resumeError?: string;
 };
 
 export interface AgentProvider {
@@ -71,6 +75,8 @@ export interface AgentProvider {
     cwd?: string;
     sessionId?: string;
     timestamp?: string;
+    desktopSession?: boolean;
+    limitEvent?: boolean;
   } | undefined;
 }
 

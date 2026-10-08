@@ -110,6 +110,11 @@ export async function runIntegrate(appName: string) {
       process.exit(1);
     }
 
+    if (key === "codex") {
+      console.log("Codex GUI integration uses transcript observation; installed app files will not be modified.");
+      continue;
+    }
+
     console.log(`Setting up integration for ${key}...`);
     for (const t of appTargets) {
       const orig = resolveHome(t.originalPath);

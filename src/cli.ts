@@ -6,10 +6,11 @@ import { handleDaemon } from "./commands/daemon.js";
 import { runManaged } from "./commands/managed.js";
 import { runGeneric } from "./commands/run.js";
 import { runStatus } from "./commands/status.js";
-import { runSessions } from "./commands/sessions.js";
+import { runSessions, runGuiSessions } from "./commands/sessions.js";
 import { runRecover } from "./commands/recover.js";
 import { runRetryNow } from "./commands/retry-now.js";
 import { runIntegrate, runUnintegrate } from "./commands/integrate.js";
+import { runCodexCheck } from "./commands/codex-check.js";
 
 const program = new Command();
 
@@ -61,6 +62,37 @@ program
   .action(runSessions);
 
 program
+  .command("gui-sessions")
+  .description("List Codex Desktop sessions with detected limits")
+  .option("--json", "Format output as JSON")
+  .action(runGuiSessions);
+
+program
+  .command("codex-check")
+  .description("Run local, non-billable Codex GUI monitoring diagnostics")
+  .action(runCodexCheck);
+
+program
+  .command("cancel-session <session-id>")
+  .description("Cancel automatic continuation for an AAR session")
+  .action(async (sessionId) => {
+    const { getSession, updateSession } = await import("./core/session-store.js");
+    const session = await getSession(sessionId);
+    if (!session) {
+      console.error(`Session ${sessionId} not found.`);
+      process.exitCode = 1;
+      return;
+    }
+    if (!["waiting_limit_reset", "ready_to_resume", "failed"].includes(session.status)) {
+      console.error(`Session ${sessionId} cannot be cancelled while status is '${session.status}'.`);
+      process.exitCode = 1;
+      return;
+    }
+    await updateSession(sessionId, { status: "cancelled" });
+    console.log(`Automatic continuation cancelled for session ${sessionId}.`);
+  });
+
+program
   .command("recover")
   .description("Manually recover waiting, failed, or cancelled sessions")
   .option("--last", "Recover the most recent session")
@@ -77,7 +109,7 @@ program
 
 program
   .command("integrate <app>")
-  .description("Integrate desktop application binary with aar (app: codex, antigravity, all)")
+  .description("Integrate supported application binaries (app: codex, antigravity, all)")
   .action(runIntegrate);
 
 program

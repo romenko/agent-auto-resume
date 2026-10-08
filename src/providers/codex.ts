@@ -9,9 +9,15 @@ export const codexProvider: AgentProvider = {
 
   detectLimit(output: string, referenceDate?: Date): LimitDetection {
     const lines = output.split(/\r?\n/);
+    const nonLimitFailure =
+      /unauthori[sz]ed|authentication required|invalid (?:api )?key|failed to connect|network error|connection refused|invalid configuration|config(?:uration)? error/i;
+    if (nonLimitFailure.test(output)) {
+      return { matched: false, provider: "codex" };
+    }
     const patterns = [
       /usage limit reached/i,
       /rate limit reached/i,
+      /rate_limit_reached/i,
       /try again at/i,
       /resets_at/i,
       /usage_limit_reached/i,
@@ -40,11 +46,14 @@ export const codexProvider: AgentProvider = {
   },
 
   getResumeCommand(state: SessionState): string[] {
+    if (!state.providerSessionId) {
+      throw new Error(`Codex session ${state.id} has no confirmed Codex thread ID; refusing to use --last.`);
+    }
     return [
       "codex",
       "exec",
       "resume",
-      "--last",
+      state.providerSessionId,
       CODEX_SAFE_RESUME_PROMPT.trim(),
     ];
   },
@@ -58,15 +67,28 @@ export const codexProvider: AgentProvider = {
       const data = JSON.parse(line);
       if (data && typeof data === "object") {
         const payload = data.payload || {};
-        const text = data.text || data.message || data.content || payload.text || payload.message || payload.content;
+        const isSessionMeta = data.type === "session_meta";
+        const eventType = typeof payload.type === "string" ? payload.type : "";
+        const errorEvent = data.type === "event_msg" && eventType === "error";
+        const rateLimits = payload.info?.rate_limits || payload.rate_limits;
+        const structuredLimit = Boolean(rateLimits?.rate_limit_reached_type);
+        const text = isSessionMeta
+          ? undefined
+          : errorEvent || structuredLimit
+            ? JSON.stringify(payload)
+            : data.text || data.message || data.content || payload.message || payload.error || payload.text || payload.content;
         const cwd = data.cwd || payload.cwd;
-        const sessionId = data.sessionId || payload.id || payload.sessionId;
+        const sessionId = isSessionMeta
+          ? payload.id || payload.session_id
+          : undefined;
         const timestamp = data.timestamp || payload.timestamp || data.createdAt || payload.createdAt;
         return {
           text: typeof text === "string" ? text : undefined,
           cwd: typeof cwd === "string" ? cwd : undefined,
           sessionId: typeof sessionId === "string" ? sessionId : undefined,
           timestamp: typeof timestamp === "string" ? timestamp : undefined,
+          desktopSession: isSessionMeta && payload.originator === "Codex Desktop",
+          limitEvent: errorEvent || structuredLimit,
         };
       }
     } catch {

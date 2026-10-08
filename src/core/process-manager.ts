@@ -8,6 +8,8 @@ import { detectLimit } from "./detector.js";
 import { getProvider } from "../providers/index.js";
 import { logger } from "./logger.js";
 
+const activeResumes = new Set<string>();
+
 function resolveCommandPath(cmd: string, customPath: string): string {
   if (cmd.includes("/") || cmd.includes("\\")) {
     return cmd;
@@ -35,7 +37,22 @@ function resolveCommandPath(cmd: string, customPath: string): string {
  * @returns 再開および実行が成功した場合は true、失敗した、または再度リミットに達した場合は false
  */
 export async function resumeSessionInBackground(state: SessionState): Promise<boolean> {
+  if (activeResumes.has(state.id)) {
+    logger.warn(`Resume already active for session ${state.id}; skipping duplicate launch.`, "aar");
+    return false;
+  }
+  const savedState = await getSession(state.id);
+  if (savedState?.status === "resuming") {
+    logger.warn(`Session ${state.id} is already marked resuming; refusing a second launch.`, "aar");
+    return false;
+  }
+  activeResumes.add(state.id);
+  let childStarted = false;
+  try {
   const provider = getProvider(state.provider);
+  if (!(await fs.pathExists(state.cwd))) {
+    throw new Error(`Working directory no longer exists: ${state.cwd}`);
+  }
 
   const resumeCommand = await provider.getResumeCommand(state);
   const resumeInput = provider.getResumeInput ? await provider.getResumeInput(state) : undefined;
@@ -47,6 +64,8 @@ export async function resumeSessionInBackground(state: SessionState): Promise<bo
     resumeCommand,
     resumeInput,
     attempts: state.attempts + 1,
+    resumeError: undefined,
+    resumePid: undefined,
   });
 
   const cmd = resumeCommand[0];
@@ -62,6 +81,7 @@ export async function resumeSessionInBackground(state: SessionState): Promise<bo
       `${home}/.npm-global/bin`,
       `${home}/.hermes/node/bin`,
       `${home}/.local/bin`,
+      `${home}/.volta/bin`,
     ];
     const newPath = [
       ...extraPaths.filter((p) => !pathEnv.includes(p)),
@@ -90,13 +110,23 @@ export async function resumeSessionInBackground(state: SessionState): Promise<bo
         AAR_SESSION_ID: state.id,
       },
     });
+    childStarted = true;
   } catch (err: any) {
     logger.error(`Failed to spawn resume command: ${err.message}`, "aar");
-    await updateSession(state.id, { status: "failed" });
+    await updateSession(state.id, {
+      status: "failed",
+      resumeError: err.message,
+      resumePid: undefined,
+    });
     return false;
   }
 
-  return new Promise<boolean>((resolve) => {
+  // Attach child listeners before yielding; ENOENT can arrive on the next tick.
+  const started = child.pid
+    ? updateSession(state.id, { resumePid: child.pid })
+    : Promise.resolve();
+
+  return await new Promise<boolean>((resolve) => {
     let resolved = false;
     const safeResolve = (val: boolean) => {
       if (!resolved) {
@@ -106,6 +136,7 @@ export async function resumeSessionInBackground(state: SessionState): Promise<bo
     };
 
     let limitDetected = false;
+    let limitUpdate: Promise<unknown> = Promise.resolve();
     let accumulatedOutput = "";
 
     // 自動プロンプト入力がある場合、プロセス起動を少し待ってから送信する
@@ -136,18 +167,14 @@ export async function resumeSessionInBackground(state: SessionState): Promise<bo
           logger.warn(`Limit re-detected during resume for session ${state.id}`, "aar");
 
           const resetAtStr = detection.resetAt ? detection.resetAt.toISOString() : new Date().toISOString();
-          updateSession(state.id, {
+          limitUpdate = started.then(() => updateSession(state.id, {
             status: "waiting_limit_reset",
             lastLimitDetectedAt: new Date().toISOString(),
             resetAt: resetAtStr,
             lastOutputSnippet: accumulatedOutput.slice(-1000),
-          }).catch(() => {});
-
-          try {
+          })).finally(() => {
             child.kill();
-          } catch {
-            // ignore
-          }
+          });
         }
       }
     };
@@ -160,15 +187,22 @@ export async function resumeSessionInBackground(state: SessionState): Promise<bo
     }
 
     child.on("error", async (err) => {
+      await started;
       logger.error(`Child process error for session ${state.id}: ${err.message}`, "aar");
       const current = await getSession(state.id);
       if (current && current.status === "resuming") {
-        await updateSession(state.id, { status: "failed" });
+        await updateSession(state.id, {
+          status: "failed",
+          resumeError: err.message,
+          resumePid: undefined,
+        });
       }
       safeResolve(false);
     });
 
-    child.on("exit", async (code) => {
+    child.on("close", async (code) => {
+      await started;
+      await limitUpdate;
       const current = await getSession(state.id);
       if (!current) {
         return safeResolve(false);
@@ -177,24 +211,38 @@ export async function resumeSessionInBackground(state: SessionState): Promise<bo
       if (current.status === "resuming") {
         if (code === 0) {
           logger.info(`Session ${state.id} completed successfully.`, "aar");
-          await updateSession(state.id, { status: "completed" });
+          await updateSession(state.id, { status: "completed", resumePid: undefined });
           safeResolve(true);
         } else {
           logger.info(`Session ${state.id} exited with code ${code}.`, "aar");
-          await updateSession(state.id, { status: "failed" });
+          await updateSession(state.id, {
+            status: "failed",
+            resumeError: `Resume process exited with code ${code}`,
+            resumePid: undefined,
+          });
           safeResolve(false);
         }
       } else if (current.status === "waiting_limit_reset") {
+        await updateSession(state.id, { resumePid: undefined });
         safeResolve(false);
       } else {
         safeResolve(false);
       }
     });
 
-    // 起動直後のエラー（ENOENT等）をキャッチするため、
-    // 次のイベントループのタイミングでエラーが無ければ起動成功とみなし、即座に呼び出し元に制御を返す
-    setImmediate(() => {
-      safeResolve(true);
-    });
   });
+  } catch (err: any) {
+    const current = await getSession(state.id);
+    if (current && (!childStarted || (current.status !== "waiting_limit_reset" && current.status !== "completed"))) {
+      await updateSession(state.id, {
+        status: "failed",
+        resumeError: err.message,
+        resumePid: undefined,
+      });
+    }
+    logger.error(`Unable to resume session ${state.id}: ${err.message}`, "aar");
+    return false;
+  } finally {
+    activeResumes.delete(state.id);
+  }
 }

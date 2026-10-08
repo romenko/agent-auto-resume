@@ -1,4 +1,4 @@
-import { loadConfig, getWaitingSessions, updateSession, ensureDirs } from "./session-store.js";
+import { loadConfig, getWaitingSessions, listSessions, updateSession, ensureDirs } from "./session-store.js";
 import { logger } from "./logger.js";
 import { writePid, clearPid, isDaemonRunning } from "./daemon-ipc.js";
 import { startTranscriptWatcher } from "./transcript-watcher.js";
@@ -23,6 +23,7 @@ export class AarDaemon {
     }
 
     await ensureDirs();
+    await this.recoverInterruptedResumes();
     await writePid(process.pid);
     logger.info(`Daemon started with PID ${process.pid}`, "aar");
 
@@ -73,6 +74,7 @@ export class AarDaemon {
   }
 
   private async processWaitingSessions() {
+    await this.reconcileInterruptedSessions();
     const waiting = await getWaitingSessions();
 
     for (const session of waiting) {
@@ -129,23 +131,57 @@ export class AarDaemon {
             });
           }
         } else {
-          try {
-            const success = await resumeSessionInBackground(session);
+          void resumeSessionInBackground(session).then((success) => {
             if (success) {
               logger.info(`Session ${session.id} resumed and completed successfully.`, "aar");
             } else {
               logger.warn(`Session ${session.id} resume failed or hit limit again.`, "aar");
             }
-          } catch (err: any) {
+          }).catch(async (err: any) => {
             logger.error(`Failed to resume session ${session.id}: ${err.message}`, "aar");
             await updateSession(session.id, {
               status: "failed",
+              resumeError: err.message,
             });
-          }
+          });
         }
       } else {
         const secondsLeft = Math.ceil(waitMsLeft / 1000);
         logger.debug(`Session ${session.id} waiting... ${secondsLeft}s left`, "aar");
+      }
+    }
+  }
+
+  private async recoverInterruptedResumes() {
+    await this.reconcileInterruptedSessions();
+  }
+
+  private async reconcileInterruptedSessions() {
+    const sessions = await listSessions();
+    for (const session of sessions.filter((item) =>
+      item.status === "resuming" || (item.status === "running" && item.source === "managed-pty")
+    )) {
+      if (Date.now() - new Date(session.updatedAt).getTime() < 60_000) {
+        continue;
+      }
+      let processAlive = false;
+      const pid = session.status === "resuming" ? session.resumePid : session.pid;
+      if (pid) {
+        try {
+          process.kill(pid, 0);
+          processAlive = true;
+        } catch (err: any) {
+          processAlive = err.code === "EPERM";
+        }
+      }
+      if (!processAlive) {
+        await updateSession(session.id, {
+          status: "failed",
+          pid: undefined,
+          resumePid: undefined,
+          resumeError: "The recorded process stopped or its state is unknown; inspect the workspace before retrying.",
+        });
+        logger.warn(`Marked interrupted session ${session.id} as failed for manual inspection.`, "aar");
       }
     }
   }

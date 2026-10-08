@@ -63,16 +63,27 @@ export async function runInPty(options: PtyRunnerOptions): Promise<void> {
     return;
   }
 
-  const ptyProcess = pty.spawn(command, args, {
-    name: "xterm-color",
-    cols: process.stdout.columns || 80,
-    rows: process.stdout.rows || 24,
-    cwd,
-    env: {
-      ...process.env,
-      AAR_SESSION_ID: session.id,
-    },
-  });
+  let ptyProcess: ReturnType<typeof pty.spawn>;
+  try {
+    ptyProcess = pty.spawn(command, args, {
+      name: "xterm-color",
+      cols: process.stdout.columns || 80,
+      rows: process.stdout.rows || 24,
+      cwd,
+      env: {
+        ...process.env,
+        AAR_SESSION_ID: session.id,
+      },
+    });
+  } catch (err: any) {
+    await updateSession(session.id, {
+      status: "failed",
+      resumeError: `Failed to start ${command}: ${err.message}`,
+      pid: undefined,
+    });
+    logger.error(`Failed to start managed process for session ${session.id}: ${err.message}`, "aar");
+    throw err;
+  }
 
   await updateSession(session.id, { pid: ptyProcess.pid, status: "running" });
 
@@ -183,15 +194,26 @@ async function runInPipe(
 ): Promise<void> {
   setMuteConsole(true);
   let child: ChildProcess;
-  child = spawn(command, args, {
-    cwd,
-    env: {
-      ...process.env,
-      AAR_SESSION_ID: session.id,
-    },
-  });
+  try {
+    child = spawn(command, args, {
+      cwd,
+      env: {
+        ...process.env,
+        AAR_SESSION_ID: session.id,
+      },
+    });
+  } catch (err: any) {
+    await updateSession(session.id, {
+      status: "failed",
+      resumeError: `Failed to start ${command}: ${err.message}`,
+      pid: undefined,
+    });
+    logger.error(`Failed to start managed process for session ${session.id}: ${err.message}`, "aar");
+    throw err;
+  }
 
-  await updateSession(session.id, { pid: child.pid, status: "running" });
+  // Do not yield before installing the error listener for an unsuccessful spawn.
+  const started = updateSession(session.id, { pid: child.pid, status: "running" });
 
 
   let limitDetected = false;
@@ -230,6 +252,7 @@ async function runInPipe(
   }
 
   async function checkLimit(str: string) {
+    await started;
     if (!limitDetected) {
       const detection = detectLimit(accumulatedOutput, session.provider);
       if (detection.matched) {
@@ -256,7 +279,23 @@ async function runInPipe(
   }
 
   return new Promise<void>((resolve) => {
+    child.on("error", async (err) => {
+      await started;
+      logger.error(`Managed child failed to start for session ${session.id}: ${err.message}`, "aar");
+      const currentSession = await getSession(session.id);
+      if (currentSession?.status === "running") {
+        await updateSession(session.id, {
+          status: "failed",
+          pid: undefined,
+          resumeError: `Failed to start ${command}: ${err.message}`,
+        });
+      }
+      process.exitCode = 1;
+      resolve();
+    });
+
     child.on("exit", async (code) => {
+      await started;
       const currentSession = await getSession(session.id);
       if (currentSession) {
         if (currentSession.status === "running") {
